@@ -474,12 +474,16 @@ static WAKER: AtomicWaker = AtomicWaker::new();
 pub unsafe fn on_interrupt() {
     WAKER.wake();
 
-    // Clear TX, RX, and normal interrupt summary flags (W1C)
-    eth().dmasr().write(|w| {
-        w.set_ts(true);
-        w.set_rs(true);
-        w.set_nis(true);
-    });
+    // Write-1-clear every DMASR status bit that is set, not just TS/RS/NIS. Clearing only those
+    // left RBUS (receive buffer unavailable, set when the RX ring fills under a packet flood) and
+    // the AIS summary latched, so the interrupt re-asserted forever and starved every task.
+    // W1C bits (CH32V307 RM, ETH_DMASR): TS0 TPSS1 TBUS2 TJTS3 ROS4 TUS5 RS6 RBUS7 RPSS8 RWTS9
+    // ETS10 FBES13 ERS14 AIS15 NIS16. The rest (PLS, EBS, TPS, RPS, ...) are read-only state.
+    const DMASR_W1C: u32 = 0x7FF | (0x7 << 13) | (1 << 16);
+    let cause = eth().dmasr().read().0 & DMASR_W1C;
+    if cause != 0 {
+        eth().dmasr().write(|w| w.0 = cause);
+    }
 
     // Two dummy reads for peripheral clock sync (per reference manual)
     eth().dmasr().read();
@@ -704,8 +708,10 @@ impl<'d, const TX: usize, const RX: usize, P: Phy> Ethernet<'d, TX, RX, P> {
             w.set_tie(true); // TX complete
             w.set_rie(true); // RX complete
             w.set_nise(true); // Normal interrupt summary
-            w.set_aise(true); // Abnormal interrupt summary
-            w.set_rbuie(true); // RX buffer unavailable
+            // Abnormal-summary and RX-buffer-unavailable interrupts stay off: while the ring is
+            // full RBUS re-sets on every dropped frame, so RBUIE would cost one interrupt per
+            // flood packet and do no work. RX resumes through `pop_packet`'s receive poll demand
+            // and the RPS-suspended check in `available()`; RBUS/AIS are still cleared above.
         });
 
         // 16. Reset and initialize PHY
