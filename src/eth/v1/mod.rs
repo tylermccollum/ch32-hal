@@ -26,11 +26,11 @@
 //! | RMII_TXD0        | PB12 | Output    |
 //! | RMII_TXD1        | PB13 | Output    |
 
-use core::sync::atomic::{fence, Ordering};
-use core::task::Context;
+use core::cell::UnsafeCell;
+use core::sync::atomic::{fence, AtomicU8, Ordering};
+use core::task::{Context, Waker};
 
 use embassy_net_driver::{Capabilities, HardwareAddress, LinkState};
-use embassy_sync::waitqueue::AtomicWaker;
 
 use crate::{pac, Peri};
 
@@ -462,7 +462,73 @@ impl Phy for GenericPhy {
 // Interrupt handler
 // ============================================================================
 
-static WAKER: AtomicWaker = AtomicWaker::new();
+/// Waker shared between the driver's owner and the ETH interrupt, with no lock and no CAS.
+///
+/// `embassy_sync::waitqueue::AtomicWaker` guards a `Cell<Option<Waker>>` with a
+/// `CriticalSectionRawMutex`, so every `receive()`/`transmit()` call (several per smoltcp poll)
+/// masked all interrupts, and so did every ETH interrupt. This waker never does: it relies on
+/// two facts that hold for this driver.
+///
+/// 1. `register` is only called from `&mut self` methods of the one `Ethernet` instance (the
+///    ETH peripheral is a singleton), so registrations never race each other.
+/// 2. The chip has a single hart, so the ETH interrupt (the only caller of `wake`) runs to
+///    completion while the registering code is suspended; the reverse never happens.
+///
+/// Two slots: `wake` reads only the slot named by `active`; `register` writes only the
+/// other slot, then publishes it with a plain atomic store. Neither side ever sees a
+/// half-written `Waker`. When the waker is unchanged (the common case) `register` only reads.
+struct IsrWaker {
+    slots: [UnsafeCell<Option<Waker>>; 2],
+    /// Index of the slot `wake` reads; `NONE` until the first registration.
+    active: AtomicU8,
+}
+
+// SAFETY: see the type docs; access is serialised by the single-registrant contract on
+// `register` and by the single hart.
+unsafe impl Sync for IsrWaker {}
+
+impl IsrWaker {
+    const NONE: u8 = 2;
+
+    const fn new() -> Self {
+        Self {
+            slots: [UnsafeCell::new(None), UnsafeCell::new(None)],
+            active: AtomicU8::new(Self::NONE),
+        }
+    }
+
+    /// # Safety
+    /// Only one execution context may call this (here: the owner of the `Ethernet`, through
+    /// `&mut self`), and never from the interrupt that calls [`Self::wake`].
+    unsafe fn register(&self, w: &Waker) {
+        let cur = self.active.load(Ordering::Relaxed);
+        if cur != Self::NONE {
+            // Reading the active slot is fine: `wake` only reads it too.
+            if let Some(old) = unsafe { &*self.slots[(cur & 1) as usize].get() } {
+                if old.will_wake(w) {
+                    return;
+                }
+            }
+        }
+        let next = if cur == 0 { 1 } else { 0 };
+        // `wake` never reads the inactive slot, so this write (and the drop of the waker that
+        // was stored there two registrations ago) cannot race it.
+        unsafe { *self.slots[next].get() = Some(w.clone()) };
+        self.active.store(next as u8, Ordering::Release);
+    }
+
+    /// Called from the ETH interrupt only.
+    fn wake(&self) {
+        let cur = self.active.load(Ordering::Acquire);
+        if cur != Self::NONE {
+            if let Some(w) = unsafe { &*self.slots[(cur & 1) as usize].get() } {
+                w.wake_by_ref();
+            }
+        }
+    }
+}
+
+static WAKER: IsrWaker = IsrWaker::new();
 
 /// Interrupt handler for the Ethernet MAC.
 ///
@@ -820,7 +886,8 @@ impl<'d, const TX: usize, const RX: usize, P: Phy> embassy_net_driver::Driver fo
         Self: 'a;
 
     fn receive(&mut self, cx: &mut Context) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        WAKER.register(cx.waker());
+        // SAFETY: `&mut self` makes this driver the single registrant (see `IsrWaker`).
+        unsafe { WAKER.register(cx.waker()) };
         if self.rx.available().is_some() && self.tx.available().is_some() {
             // rx and tx are disjoint struct fields, Rust permits simultaneous &mut borrows.
             Some((RxToken { rx: &mut self.rx }, TxToken { tx: &mut self.tx }))
@@ -830,7 +897,8 @@ impl<'d, const TX: usize, const RX: usize, P: Phy> embassy_net_driver::Driver fo
     }
 
     fn transmit(&mut self, cx: &mut Context) -> Option<Self::TxToken<'_>> {
-        WAKER.register(cx.waker());
+        // SAFETY: `&mut self` makes this driver the single registrant (see `IsrWaker`).
+        unsafe { WAKER.register(cx.waker()) };
         if self.tx.available().is_some() {
             Some(TxToken { tx: &mut self.tx })
         } else {
