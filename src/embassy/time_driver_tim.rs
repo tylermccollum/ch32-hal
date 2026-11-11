@@ -205,8 +205,18 @@ impl RtcDriver {
     fn on_interrupt(&self) {
         let r = regs_gp16();
 
-        // XXX: reduce the size of this critical section ?
-        critical_section::with(|cs| {
+        // No global critical section here. The alarm and queue are shared only with
+        // `schedule_wake`, which runs in task context and masks this one interrupt (not all
+        // of them) while it touches them, so inside this handler nothing else can reach
+        // them: task code cannot run until it returns. Masking every interrupt here (the old
+        // code) delayed higher-priority vectors, such as a motor current loop, by the whole
+        // queue walk, wakes included.
+        //
+        // Contract: `schedule_wake` must only be called from thread (task) mode, never from
+        // an interrupt handler, and the chip is single-hart.
+        {
+            // SAFETY: exclusion as argued above; the token only proves it to `Mutex::borrow`.
+            let cs = unsafe { CriticalSection::new() };
             let sr = r.intfr().read(); // status register
             let dier = r.dmaintenr().read(); // DMA/Interrupt enable register
 
@@ -228,7 +238,7 @@ impl RtcDriver {
             if sr.ccif(1) && dier.ccie(1) { // Capture/compare 1 interrupt flag & Capture/Compare 1 interrupt enable
                 self.trigger_alarm(cs);
             }
-        })
+        }
     }
 
     fn next_period(&self) {
@@ -239,16 +249,16 @@ impl RtcDriver {
         self.period.store(period, Ordering::Relaxed);
         let t = (period as u64) << 15;
 
-        critical_section::with(move |cs| {
-            r.dmaintenr().modify(move |w| {
-                let alarm = self.alarm.borrow(cs);
-                let at = alarm.timestamp.get();
+        // Only called from `on_interrupt`; see the exclusion argument there.
+        let cs = unsafe { CriticalSection::new() };
+        r.dmaintenr().modify(move |w| {
+            let alarm = self.alarm.borrow(cs);
+            let at = alarm.timestamp.get();
 
-                if at < t + 0xc000 {
-                    // just enable it. `set_alarm` has already set the correct CCR val.
-                    w.set_ccie(1, true); // Capture/Compare 1 interrupt enable
-                }
-            })
+            if at < t + 0xc000 {
+                // just enable it. `set_alarm` has already set the correct CCR val.
+                w.set_ccie(1, true); // Capture/Compare 1 interrupt enable
+            }
         })
     }
 
@@ -313,7 +323,18 @@ impl Driver for RtcDriver {
     }
 
     fn schedule_wake(&self, at: u64, waker: &core::task::Waker) {
-        critical_section::with(|cs| {
+        // Mask only this timer's interrupt, the one other context that touches the alarm and
+        // queue (see `on_interrupt`), instead of every interrupt. Thread mode only.
+        type Irq = <T as GeneralInstance16bit>::CaptureCompareInterrupt;
+        let was_enabled = Irq::is_enabled();
+        Irq::disable();
+        // Read back so the PFIC write has landed before the queue is touched; an interrupt
+        // taken before this point runs to completion first, which is fine.
+        let _ = Irq::is_enabled();
+        compiler_fence(Ordering::SeqCst);
+        {
+            // SAFETY: the only other user of the alarm and queue is masked.
+            let cs = unsafe { CriticalSection::new() };
             let mut queue = self.queue.borrow(cs).borrow_mut();
 
             if queue.schedule_wake(at, waker) {
@@ -322,7 +343,11 @@ impl Driver for RtcDriver {
                     next = queue.next_expiration(self.now());
                 }
             }
-        })
+        }
+        compiler_fence(Ordering::SeqCst);
+        if was_enabled {
+            unsafe { Irq::enable() };
+        }
     }
 }
 
