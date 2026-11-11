@@ -17,6 +17,8 @@ use embassy_time_driver::{Driver, TICK_HZ};
 use embassy_time_queue_utils::Queue;
 
 use crate::interrupt::typelevel::Interrupt;
+#[cfg(feature = "tim-time-driver-local-mask")]
+use crate::interrupt_ext::InterruptExt;
 use crate::pac::timer::{regs, vals, Gptm};
 use crate::peripheral::SealedRccPeripheral;
 use crate::peripherals;
@@ -48,6 +50,87 @@ type T = peripherals::TIM10;
 
 fn regs_gp16() -> Gptm {
     unsafe { Gptm::from_ptr(T::regs()) }
+}
+
+// Exclusion for the alarm and the timer queue. They are shared between `schedule_wake`
+// (called from tasks) and `on_interrupt` (and `next_period`, which it calls).
+//
+// Default: one global critical section for both, as before.
+//
+// `tim-time-driver-local-mask`: see the feature in Cargo.toml for the full contract.
+// `schedule_wake` masks only the timer's own interrupts (update and capture/compare)
+// and the handler takes nothing: task code cannot run while the handler does, and the handler
+// cannot start while `schedule_wake` holds its interrupts masked. Interrupts of any other
+// source, such as a higher-priority control loop, are never delayed.
+
+/// Exclusion for code running in the timer interrupt handler.
+#[cfg(not(feature = "tim-time-driver-local-mask"))]
+#[inline]
+fn with_state_isr<R>(f: impl FnOnce(CriticalSection) -> R) -> R {
+    critical_section::with(f)
+}
+
+/// Exclusion for code running in the timer interrupt handler.
+#[cfg(feature = "tim-time-driver-local-mask")]
+#[inline]
+fn with_state_isr<R>(f: impl FnOnce(CriticalSection) -> R) -> R {
+    // SAFETY: the only other context that touches the state is `schedule_wake` in thread mode,
+    // which masks this handler's interrupts for as long as it does, and the handler's own
+    // vectors share one priority so they do not nest (contract of the feature).
+    f(unsafe { CriticalSection::new() })
+}
+
+/// Exclusion for `schedule_wake`, which runs in thread mode.
+#[cfg(not(feature = "tim-time-driver-local-mask"))]
+#[inline]
+fn with_state_task<R>(f: impl FnOnce(CriticalSection) -> R) -> R {
+    critical_section::with(f)
+}
+
+/// Exclusion for `schedule_wake`, which runs in thread mode.
+#[cfg(feature = "tim-time-driver-local-mask")]
+#[inline]
+fn with_state_task<R>(f: impl FnOnce(CriticalSection) -> R) -> R {
+    use crate::pac::InterruptNumber;
+
+    // Contract check, debug builds only: GISR.NESTSTA (PFIC_GISR, 0xE000E04C, bits 7:0) is
+    // non-zero while any interrupt handler is executing (CH32V30x RM, 9.5.2.11). Verified
+    // against the RM only, not on hardware.
+    #[cfg(all(debug_assertions, qingke_v4))]
+    debug_assert!(
+        unsafe { core::ptr::read_volatile(0xE000_E04C as *const u32) } & 0xFF == 0,
+        "time driver: schedule_wake called from interrupt context, which tim-time-driver-local-mask forbids"
+    );
+
+    let up = <<T as CoreInstance>::UpdateInterrupt as Interrupt>::IRQ;
+    let cc = <<T as GeneralInstance16bit>::CaptureCompareInterrupt as Interrupt>::IRQ;
+    // On chips where both events share one vector this is the same interrupt: mask it once.
+    let same = up.number() == cc.number();
+
+    let up_was_enabled = up.is_enabled();
+    let cc_was_enabled = !same && cc.is_enabled();
+    up.disable();
+    if !same {
+        cc.disable();
+    }
+    // Read back so the PFIC write has landed before the state is touched. A handler that was
+    // already taken before this point has run to completion (it cannot be preempted by task
+    // code), and one that fires later stays pending until the interrupt is unmasked below.
+    let _ = up.is_enabled();
+    compiler_fence(Ordering::SeqCst);
+
+    // SAFETY: the only other context that touches the state is masked.
+    let r = f(unsafe { CriticalSection::new() });
+
+    compiler_fence(Ordering::SeqCst);
+    // Restore the previous state rather than enabling unconditionally.
+    if up_was_enabled {
+        unsafe { up.enable() };
+    }
+    if cc_was_enabled {
+        unsafe { cc.enable() };
+    }
+    r
 }
 
 // Clock timekeeping works with something we call "periods", which are time intervals
@@ -154,8 +237,8 @@ impl RtcDriver {
     fn on_interrupt(&self) {
         let r = regs_gp16();
 
-        // XXX: reduce the size of this critical section ?
-        critical_section::with(|cs| {
+        // XXX: reduce the size of this critical section ? (see `tim-time-driver-local-mask`)
+        with_state_isr(|cs| {
             let sr = r.intfr().read(); // status register
             let dier = r.dmaintenr().read(); // DMA/Interrupt enable register
 
@@ -188,7 +271,7 @@ impl RtcDriver {
         self.period.store(period, Ordering::Relaxed);
         let t = (period as u64) << 15;
 
-        critical_section::with(move |cs| {
+        with_state_isr(move |cs| {
             r.dmaintenr().modify(move |w| {
                 let alarm = self.alarm.borrow(cs);
                 let at = alarm.timestamp.get();
@@ -262,7 +345,7 @@ impl Driver for RtcDriver {
     }
 
     fn schedule_wake(&self, at: u64, waker: &core::task::Waker) {
-        critical_section::with(|cs| {
+        with_state_task(|cs| {
             let mut queue = self.queue.borrow(cs).borrow_mut();
 
             if queue.schedule_wake(at, waker) {

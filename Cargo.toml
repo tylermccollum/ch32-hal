@@ -108,6 +108,24 @@ time-driver-tim9 = ["_time-driver"]
 time-driver-tim10 = ["_time-driver"]
 rt-wfi = []
 
+## Time-driver tuning, off by default (unlike the `time-driver-*` features this does not
+## select a timer, so it is named so that `build.rs` does not mistake it for one).
+##
+## Makes the `time-driver-timN` TIM driver mask only its own timer interrupts (update and
+## capture/compare) in `schedule_wake`, instead of all interrupts, and take no mask in its
+## interrupt handler. This keeps higher-priority interrupts from being delayed by the
+## timer queue walk. It is only correct if ALL of these hold:
+## - `embassy_time::Timer`, `Delay` etc. (anything reaching `schedule_wake`) is only used from
+##   thread mode (tasks of a thread-mode executor), never from an interrupt handler (so no
+##   `InterruptExecutor`, no `Timer::after(..)` polled in an ISR);
+## - single hart (the dual-core CH32H4xx is not covered by this feature);
+## - if the timer's update and capture/compare events are separate interrupts on your chip,
+##   both have the same priority (so the handler cannot preempt itself through the other
+##   vector).
+## With debug assertions on, `schedule_wake` panics when called from interrupt context
+## (QingKe V4 only; see `src/embassy/time_driver_tim.rs`).
+tim-time-driver-local-mask = []
+
 # Chip-selection features
 
 ch32l103c8t6 = ["ch32-metapac/ch32l103c8t6", "qingke-rt/v4c", "qingke/v4c"]
