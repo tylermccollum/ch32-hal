@@ -395,12 +395,27 @@ pub trait Phy {
     fn phy_init(&mut self, smi: &Smi);
     /// Poll the link state. Returns true if link is up.
     fn poll_link(&mut self, smi: &Smi, cx: &mut Context) -> bool;
+    /// The duplex the link came up at, read after a link-up: `Some(true)` full, `Some(false)` half,
+    /// `None` unknown (the MAC is then left as it is). The default keeps the old behaviour.
+    fn negotiated_full_duplex(&mut self, _smi: &Smi) -> Option<bool> {
+        None
+    }
 }
+
+/// Duplex the MAC was last set to after a link-up: 0 = not yet known, 1 = half, 2 = full.
+/// Readable by the application (the driver itself is owned by the network stack).
+pub static LINK_DUPLEX: AtomicU8 = AtomicU8::new(0);
 
 /// MII PHY register constants.
 mod phy_regs {
     pub const BCR: u8 = 0x00;
     pub const BSR: u8 = 0x01;
+    /// Auto-negotiation advertisement.
+    pub const ANAR: u8 = 0x04;
+    /// Auto-negotiation link-partner ability.
+    pub const ANLPAR: u8 = 0x05;
+    /// Auto-negotiation expansion.
+    pub const ANER: u8 = 0x06;
     /// WCH internal 10M PHY MDIX/polarity control register.
     pub const MDIX: u8 = 0x1E;
 
@@ -409,6 +424,14 @@ mod phy_regs {
     pub const BCR_AUTONEG_RESTART: u16 = 1 << 9;
 
     pub const BSR_LINK_UP: u16 = 1 << 2;
+    pub const BSR_AUTONEG_COMPLETE: u16 = 1 << 5;
+
+    /// IEEE 802.3 selector field.
+    pub const ANAR_SELECTOR_8023: u16 = 0x0001;
+    pub const ANAR_10_HD: u16 = 1 << 5;
+    pub const ANAR_10_FD: u16 = 1 << 6;
+    /// ANER: the link partner takes part in auto-negotiation.
+    pub const ANER_LP_AUTONEG_ABLE: u16 = 1 << 0;
 
     /// Auto PN polarity detection (bits 3:2 = 0b10).
     pub const MDIX_PN_AUTO: u16 = 2 << 2;
@@ -444,6 +467,13 @@ impl Phy for GenericPhy {
         // Set auto PN polarity on MDIX register (WCH internal 10M PHY
         // needs this for reliable link establishment; harmless on external PHYs).
         smi.write(self.phy_addr, phy_regs::MDIX, phy_regs::MDIX_PN_AUTO);
+        // Advertise what the MAC can do at 10 Mb/s, full and half duplex, rather than relying on the
+        // PHY's reset default; the MAC follows whatever is negotiated (`negotiated_full_duplex`).
+        smi.write(
+            self.phy_addr,
+            phy_regs::ANAR,
+            phy_regs::ANAR_SELECTOR_8023 | phy_regs::ANAR_10_HD | phy_regs::ANAR_10_FD,
+        );
         // Start auto-negotiation
         smi.write(
             self.phy_addr,
@@ -455,6 +485,21 @@ impl Phy for GenericPhy {
     fn poll_link(&mut self, smi: &Smi, _cx: &mut Context) -> bool {
         let bsr = smi.read(self.phy_addr, phy_regs::BSR);
         bsr & phy_regs::BSR_LINK_UP != 0
+    }
+
+    /// IEEE 802.3 resolution: full duplex only when both ends negotiated and both advertise it. A
+    /// partner that does not negotiate (parallel detection) runs half duplex, so the MAC must too.
+    fn negotiated_full_duplex(&mut self, smi: &Smi) -> Option<bool> {
+        let bsr = smi.read(self.phy_addr, phy_regs::BSR);
+        if bsr & phy_regs::BSR_LINK_UP == 0 {
+            return None;
+        }
+        let aner = smi.read(self.phy_addr, phy_regs::ANER);
+        if bsr & phy_regs::BSR_AUTONEG_COMPLETE == 0 || aner & phy_regs::ANER_LP_AUTONEG_ABLE == 0 {
+            return Some(false);
+        }
+        let common = smi.read(self.phy_addr, phy_regs::ANAR) & smi.read(self.phy_addr, phy_regs::ANLPAR);
+        Some(common & phy_regs::ANAR_10_FD != 0)
     }
 }
 
@@ -618,6 +663,8 @@ pub struct Ethernet<'d, const TX: usize, const RX: usize, P: Phy> {
     smi: Smi,
     mac_addr: [u8; 6],
     phy_interface: PhyInterface,
+    /// Link state at the last `link_state` poll, to act on the up edge.
+    link_up: bool,
 }
 
 impl<'d, const TX: usize, const RX: usize, P: Phy> Ethernet<'d, TX, RX, P> {
@@ -796,6 +843,7 @@ impl<'d, const TX: usize, const RX: usize, P: Phy> Ethernet<'d, TX, RX, P> {
             smi,
             mac_addr,
             phy_interface,
+            link_up: false,
         }
     }
 
@@ -914,7 +962,17 @@ impl<'d, const TX: usize, const RX: usize, P: Phy> embassy_net_driver::Driver fo
     }
 
     fn link_state(&mut self, cx: &mut Context) -> LinkState {
-        if self.phy.poll_link(&self.smi, cx) {
+        let up = self.phy.poll_link(&self.smi, cx);
+        if up && !self.link_up {
+            // Link (re)established: match the MAC's duplex to what the PHY negotiated. A mismatch
+            // (MAC full, partner half) drops frames as late collisions and stalls TCP.
+            if let Some(full) = self.phy.negotiated_full_duplex(&self.smi) {
+                eth().maccr().modify(|w| w.set_dm(full));
+                LINK_DUPLEX.store(if full { 2 } else { 1 }, Ordering::Relaxed);
+            }
+        }
+        self.link_up = up;
+        if up {
             LinkState::Up
         } else {
             LinkState::Down
